@@ -1,0 +1,331 @@
+#include <WiFiS3.h>
+#include <LiquidCrystal.h>
+
+// =========================================================================
+// COLOQUE AQUI OS DADOS DA SUA REDE WIFI
+// =========================================================================
+const char SSID[] = "Desktop_F8461810"; 
+const char PASS[] = "1136762703837058"; 
+
+// Inicializa o servidor web na porta padrão 80 (HTTP)
+WiFiServer server(80);
+
+// ---------- Pinos ----------
+const byte PIN_SENSOR  = A0;
+const byte PIN_BOMBA   = 5;
+const byte PIN_LEITURA = 6;
+const byte PIN_TECLA_A = 13;
+const byte PIN_TECLA_B = 12;
+const byte PIN_TECLA_C = 11;
+
+LiquidCrystal tela(A1, A2, A3, A4, A5, 2);
+
+// ---------- Calibração do sensor ----------
+const int SENSOR_SECO     = 0;
+const int SENSOR_MOLHADO = 876;
+
+// ---------- Segurança ----------
+const byte HISTERESE = 2;                     
+const unsigned long TEMPO_MAX_MANUAL = 10000; 
+const unsigned long TEMPO_MAX_AUTO   = 30000; 
+const unsigned long ESPERA_CICLOS    = 3000;  
+
+// ---------- Estado ----------
+enum Pagina { MENU, VER, SET, MANUAL };        
+Pagina pagina = MENU;
+byte opcao = 0;                                
+bool autoAtivo = true;                        
+
+int umidade = 0;
+int meta = 50;
+bool bombaLigada = false;
+bool modoManual = false;
+bool alertaTempo = false;                     
+bool temFim = false;
+unsigned long inicioBomba = 0, fimBomba = 0, ultimaTela = 0;
+
+// ---------- Funções da bomba ----------
+void ligaBomba(bool manual) {
+  digitalWrite(PIN_BOMBA, HIGH);
+  bombaLigada = true;
+  modoManual = manual;
+  inicioBomba = millis();
+}
+
+void desligaBomba() {
+  digitalWrite(PIN_BOMBA, LOW);
+  if (bombaLigada) { fimBomba = millis(); temFim = true; }
+  bombaLigada = false;
+  modoManual = false;
+}
+
+void controlaBomba() {
+  unsigned long agora = millis();
+  if (umidade >= meta) alertaTempo = false;
+
+  if (bombaLigada) {
+    unsigned long limite = modoManual ? TEMPO_MAX_MANUAL : TEMPO_MAX_AUTO;
+    if (agora - inicioBomba >= limite) {
+      bool eraManual = modoManual;
+      desligaBomba();
+      if (!eraManual) alertaTempo = true;
+    } else if (!modoManual && (!autoAtivo || umidade >= constrain(meta + HISTERESE, 0, 100))) {
+      desligaBomba();
+    }
+  } else if (!modoManual && autoAtivo) {
+    bool esperou = !temFim || (agora - fimBomba >= ESPERA_CICLOS);
+    if (umidade < meta && esperou) {
+      ligaBomba(false);
+      alertaTempo = false;
+    }
+  }
+}
+
+// ---------- Sensor ----------
+int lePorcentagem() {
+  long soma = 0;
+  for (byte i = 0; i < 8; i++) soma += analogRead(PIN_SENSOR);
+  int bruto = soma / 8;
+  return constrain(map(bruto, SENSOR_SECO, SENSOR_MOLHADO, 0, 100), 0, 100);
+}
+
+// ---------- Teclado ----------
+char leTecla() {
+  char t = 0;
+  digitalWrite(PIN_TECLA_A, HIGH);
+  if (digitalRead(PIN_LEITURA) == HIGH) t = 'A';
+  digitalWrite(PIN_TECLA_A, LOW);
+
+  digitalWrite(PIN_TECLA_B, HIGH);
+  if (digitalRead(PIN_LEITURA) == HIGH) t = 'B';
+  digitalWrite(PIN_TECLA_B, LOW);
+
+  digitalWrite(PIN_TECLA_C, HIGH);
+  if (digitalRead(PIN_LEITURA) == HIGH) t = 'C';
+  digitalWrite(PIN_TECLA_C, LOW);
+  return t;
+}
+
+char teclaPressionada() {
+  static char ultima = 0;
+  static unsigned long proximo = 0;
+  unsigned long agora = millis();
+  char atual = leTecla();
+  char evento = 0;
+
+  if (atual && atual != ultima) {
+    evento = atual;
+    proximo = agora + 500;
+  } else if (atual && agora >= proximo) {
+    evento = atual;
+    proximo = agora + 150;
+  }
+  ultima = atual;
+  return evento;
+}
+
+// ---------- Display ----------
+void escreve(byte linha, const char* txt) {
+  char buf[17];
+  snprintf(buf, sizeof(buf), "%-16s", txt);   
+  tela.setCursor(0, linha);
+  tela.print(buf);
+}
+
+void atualizaTela() {
+  char b[24];
+  switch (pagina) {
+    case MENU:
+      escreve(0, "(A)Enter (B)Next");
+      if (opcao == 0)      escreve(1, "> Ver Umidade");
+      else if (opcao == 1) escreve(1, "> Set Umidade");
+      else if (opcao == 2) escreve(1, "> Irrigar Manual");
+      else                 escreve(1, autoAtivo ? "> Auto: ON" : "> Auto: OFF");
+      break;
+
+    case VER:
+      snprintf(b, sizeof(b), "Umid:%d%% Meta:%d", umidade, meta);
+      escreve(0, b);
+      if (alertaTempo) {
+        escreve(1, "!Limite  (C)Back");
+      } else {
+        snprintf(b, sizeof(b), "Bomba:%-3s(C)Back", bombaLigada ? "ON" : "OFF");
+        escreve(1, b);
+      }
+      break;
+
+    case SET:
+      escreve(0, "(A)+(B)- (C)Back");
+      snprintf(b, sizeof(b), "Meta: %d%%", meta);
+      escreve(1, b);
+      break;
+
+    case MANUAL:
+      if (bombaLigada && modoManual) {
+        long restante = (long)TEMPO_MAX_MANUAL - (long)(millis() - inicioBomba);
+        if (restante < 0) restante = 0;
+        escreve(0, "(C)Parar");
+        snprintf(b, sizeof(b), "Ativa %lds", restante / 1000);
+        escreve(1, b);
+      } else {
+        escreve(0, "(A)Start (C)Back");
+        escreve(1, "Parado");
+      }
+      break;
+  }
+}
+
+void trataTecla(char t) {
+  switch (pagina) {
+    case MENU:
+      if (t == 'B') opcao = (opcao + 1) % 4;
+      else if (t == 'A') {
+        if (opcao == 3) autoAtivo = !autoAtivo;    
+        else pagina = (Pagina)(opcao + 1);
+      }
+      break;
+
+    case VER:
+      if (t == 'C') pagina = MENU;
+      break;
+
+    case SET:
+      if (t == 'A' && meta < 100) meta++; 
+      else if (t == 'B' && meta > 0) meta--; 
+      else if (t == 'C') pagina = MENU;
+      break;
+
+    case MANUAL:
+      if (t == 'A' && !bombaLigada) ligaBomba(true);
+      else if (t == 'C') {
+        if (bombaLigada && modoManual) desligaBomba();
+        else pagina = MENU;
+      }
+      break;
+  }
+  atualizaTela();
+}
+
+// ---------- Gerenciador da Página Web (IP Local) ----------
+void gerenciaServidorWeb() {
+  WiFiClient client = server.available(); 
+  if (client) {
+    String currentLine = ""; 
+    while (client.connected()) {
+      if (client.available()) {
+        char c = client.read();
+        if (c == '\n') {
+          if (currentLine.length() == 0) {
+            client.println("HTTP/1.1 200 OK");
+            client.println("Content-type:text/html; charset=utf-8");
+            client.println("Connection: close");
+            client.println();
+            
+            client.println("<!DOCTYPE html><html>");
+            client.println("<head><meta name='viewport' content='width=device-width, initial-scale=1'>");
+            client.println("<meta http-equiv='refresh' content='5'>"); 
+            client.println("<style>html { font-family: Helvetica; display: inline-block; margin: 0px auto; text-align: center;}");
+            client.println(".button { background-color: #4CAF50; border: none; color: white; padding: 16px 40px;");
+            client.println("text-decoration: none; font-size: 30px; margin: 2px; cursor: pointer;}");
+            client.println(".button2 {background-color: #f44336;}</style></head>");
+            
+            client.println("<body><h1>Monitor de Irrigação R4</h1>");
+            client.println("<h2>Umidade Atual: " + String(umidade) + "%</h2>");
+            client.println("<h2>Meta Definida: " + String(meta) + "%</h2>");
+            client.println("<h2>Modo Automático: " + String(autoAtivo ? "LIGADO" : "DESLIGADO") + "</h2>");
+            
+            if (bombaLigada) {
+              client.println("<p>Status da Bomba: <strong>LIGADA</strong></p>");
+              client.println("<p><a href='/H'><button class='button button2'>DESLIGAR BOMBA</button></a></p>");
+            } else {
+              client.println("<p>Status da Bomba: <strong>DESLIGADA</strong></p>");
+              client.println("<p><a href='/L'><button class='button'>LIGAR BOMBA</button></a></p>");
+            }
+            client.println("</body></html>");
+            client.println();
+            break;
+          } else {
+            currentLine = "";
+          }
+        } else if (c != '\r') {
+          currentLine += c;
+        }
+
+        if (currentLine.endsWith("GET /L")) {
+          ligaBomba(true);
+        }
+        if (currentLine.endsWith("GET /H")) {
+          desligaBomba();
+        }
+      }
+    }
+    client.stop(); 
+  }
+}
+
+// ---------- Configuração Inicial ----------
+void setup() {
+  Serial.begin(9600);
+  delay(1500);
+  
+  pinMode(PIN_BOMBA, OUTPUT);
+  pinMode(PIN_LEITURA, INPUT);
+  pinMode(PIN_TECLA_A, OUTPUT);
+  pinMode(PIN_TECLA_B, OUTPUT);
+  pinMode(PIN_TECLA_C, OUTPUT);
+  pinMode(10, OUTPUT);                     
+  digitalWrite(PIN_BOMBA, LOW);
+
+  tela.begin(16, 2);
+  
+  tela.clear();
+  tela.setCursor(0, 0);
+  tela.print("Conectando WiFi...");
+  
+  WiFi.begin(SSID, PASS);
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  while (WiFi.localIP() == IPAddress(0,0,0,0)) {
+    tela.setCursor(0, 1);
+    tela.print("Obtendo IP...   ");
+    delay(500);
+  }
+
+  server.begin();
+
+  IPAddress ip = WiFi.localIP();
+  
+  tela.clear();
+  tela.setCursor(0, 0);
+  tela.print("WiFi Conectado!");
+  tela.setCursor(0, 1);
+  tela.print(ip); 
+  
+  Serial.print("Acesse o sistema pelo IP: http://");
+  Serial.println(ip);
+  
+  delay(5000); 
+
+  umidade = lePorcentagem();
+  atualizaTela(); 
+}
+
+// ---------- Loop Principal ----------
+void loop() {
+  umidade = lePorcentagem();
+  controlaBomba();                     
+  
+  gerenciaServidorWeb();
+
+  char t = teclaPressionada();
+  if (t) trataTecla(t);
+
+  if (millis() - ultimaTela >= 200) {  
+    ultimaTela = millis();
+    atualizaTela();
+  }
+}
